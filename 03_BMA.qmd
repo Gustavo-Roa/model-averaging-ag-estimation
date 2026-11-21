@@ -1,0 +1,522 @@
+---
+title: "Bayesian model averaging (BMA)"
+subtitle: "Tutorial for estimating an optimum level or critical value under model uncertainty"
+author: "Gustavo A. Roa"
+date: "2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+## What this tutorial does
+
+This document shows how to estimate an *optimum level or critical value* under model uncertainty using:
+
+\- multiple Bayesian candidate response models,
+
+\- Bayesian model averaging (BMA), where posterior model probabilities derived from marginal likelihoods are used to combine model-specific optimum estimates into a single model-averaged posterior distribution.
+
+The dataset and the specific optimum definition used here are only examples. The workflow is the main deliverable.
+
+------------------------------------------------------------------------
+
+# Setup
+
+This tutorial requires a working installation of Stan via the rstan interface. Installation instructions are available at: https://mc-stan.org/tools/
+
+```{r}
+# Core packages
+library(tidyverse)
+
+# Data I/O
+library(readxl)
+
+# Bayesian fitting + marginal likelihood
+library(rstan)
+library(bridgesampling)
+
+```
+
+# Stan parallelization
+
+```{r}
+# Enable parallel chains for rstan
+set.seed(123)
+mc.cores <- max(1L, parallel::detectCores() - 1L)
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = mc.cores)
+```
+
+# Data
+
+## Load dataset
+
+```{r}
+dat <- read_excel("./case_study_AONR.xlsx", sheet = "Trial_27") |>
+  dplyr::select(
+    input_level = Total_N_SI,
+    response    = Yield_SY
+  ) |>
+  dplyr::filter(is.finite(input_level), is.finite(response))
+
+```
+
+## Visual check
+
+```{r}
+ggplot(dat, aes(input_level, response)) +
+  geom_point()
+
+```
+
+# Bayesian model averaging
+
+The Stan models used in this section are adapted from the Bayesian Model Averaging implementation developed by Francisco Palmero for EONR estimation. The original code has been modified and reorganized for tutorial purposes and integration into this workflow. https://github.com/FranciscoPalmero/Bayesian-Model-Averagin_EONR.git
+
+## Candidate Bayesian models in Stan
+
+```{r}
+# Linear-Plateau model
+stan_model_LinPl <- "
+data {
+  int<lower=0> N;
+  vector[N] y;
+  vector[N] x;
+}
+
+parameters {
+  real<lower=0> b0;
+  real<lower=0> b1;
+  real<lower=0> tau;
+  real<lower=0> sigma;
+}
+
+model {
+  vector[N] mu;
+  for (i in 1:N) {
+    if (x[i] < tau) {
+      mu[i] = b0 + b1 * x[i];
+    } else {
+      mu[i] = b0 + b1 * tau;
+    }
+  }
+
+  target += normal_lpdf(y | mu, sigma);
+  target += gamma_lpdf(b0  | 6, 6 / 5979.59);
+  target += gamma_lpdf(b1  | 6, 6 / 45.0);
+  target += gamma_lpdf(tau | 6, 6 / 150.49);
+  target += inv_gamma_lpdf(sigma | 6, 5000.0);
+}
+
+generated quantities {
+  real OPT;
+  OPT = tau;
+}
+"
+
+## Quadratic-Plateau model
+stan_model_QP <- "
+data {
+  int<lower=0> N;
+  vector[N] y;
+  vector[N] x;
+}
+
+parameters {
+  real<lower=0> b0;
+  real<lower=0> b1;
+  real<lower=0> b2;
+  real<lower=0> sigma;
+}
+
+model {
+  vector[N] mu;
+  for (i in 1:N) {
+    real xp = b1 / (2 * b2);
+    if (x[i] < xp) {
+      mu[i] = b0 + b1 * x[i] - b2 * x[i]^2;
+    } else {
+      mu[i] = b0 + b1 * xp - b2 * xp^2;
+    }
+  }
+
+  target += normal_lpdf(y | mu, sigma);
+  target += gamma_lpdf(b0 | 6, 6 / 5979.59);
+  target += gamma_lpdf(b1 | 6, 6 / 45.0);
+  target += gamma_lpdf(b2 | 6, 6 / 0.1875);
+  target += inv_gamma_lpdf(sigma | 6, 5000.0);
+}
+
+generated quantities {
+  real OPT;
+  OPT = fmax(b1 / (2 * b2), 0);
+}
+"
+
+## Mitscherlich model
+stan_model_MIT <- "
+data {
+  int<lower=0> N;
+  vector[N] y;
+  vector[N] x;
+}
+
+parameters {
+  real<lower=0> b1;
+  real<lower=b1> b0;
+  real<lower=0> b2;
+  real<lower=0> sigma;
+}
+
+model {
+  real mean_b0 = 12121.21;
+  real mean_b1 = 6000.0;
+
+  target += normal_lpdf(y | b0 + (b1 - b0) * exp(-b2 * x), sigma);
+  target += gamma_lpdf(b0 | 6, 6 / mean_b0);
+  target += gamma_lpdf(b1 | 6, 6 / mean_b1);
+  target += gamma_lpdf(b2 | 6, 6 / 0.0099901);
+  // Normalize the joint prior over b0 > b1 for bridge sampling.
+  target += -beta_lccdf(mean_b1 / (mean_b0 + mean_b1) | 6, 6);
+  target += inv_gamma_lpdf(sigma | 6, 5000.0);
+}
+
+generated quantities {
+  real OPT;
+  OPT = -log((1 - 0.95) * b0 / (b0 - b1)) / b2;
+}
+"
+
+## Quadratic model
+stan_model_QD <- "
+data {
+  int<lower=0> N;
+  vector[N] y;
+  vector[N] x;
+}
+
+parameters {
+  real<lower=0> b0;
+  real<lower=0> b1;
+  real<lower=0> b2;
+  real<lower=0> sigma;
+}
+
+model {
+  target += normal_lpdf(y | b0 + b1 * x - b2 * x^2, sigma);
+  target += gamma_lpdf(b0 | 6, 6 / 5979.59);
+  target += gamma_lpdf(b1 | 6, 6 / 45.0);
+  target += gamma_lpdf(b2 | 6, 6 / 0.1875);
+  target += inv_gamma_lpdf(sigma | 6, 5000.0);
+}
+
+generated quantities {
+  real OPT;
+  OPT = b1 / (2 * b2);
+}
+"
+```
+
+## Fit functions
+
+```{r}
+bayes_model_LinPl <- function(x, y,
+                              param_saved = c("b0","b1","tau","OPT","sigma"),
+                              chains = 4, iter = 4000, warmup = 2000,
+                              cores = 1, apt_del = 0.95, thin = 5, seed = 123){
+  df.list <- list(x = x, y = y, N = length(y))
+  stan(model_code = stan_model_LinPl,
+       data = df.list,
+       chains = chains, iter = iter, warmup = warmup,
+       cores = cores, control = list(adapt_delta = apt_del),
+       thin = thin, seed = seed, pars = param_saved, refresh = 0)
+}
+
+bayes_model_QP <- function(x, y,
+                           param_saved = c("b0","b1","b2","OPT","sigma"),
+                           chains = 4, iter = 4000, warmup = 2000,
+                           cores = 1, apt_del = 0.95, thin = 5, seed = 123){
+  df.list <- list(x = x, y = y, N = length(y))
+  stan(model_code = stan_model_QP,
+       data = df.list,
+       chains = chains, iter = iter, warmup = warmup,
+       cores = cores, control = list(adapt_delta = apt_del),
+       thin = thin, seed = seed, pars = param_saved, refresh = 0)
+}
+
+bayes_model_MIT <- function(x, y,
+                            param_saved = c("b0","b1","b2","OPT","sigma"),
+                            chains = 4, iter = 4000, warmup = 2000,
+                            cores = 1, apt_del = 0.95, thin = 5, seed = 123){
+  df.list <- list(x = x, y = y, N = length(y))
+  stan(model_code = stan_model_MIT,
+       data = df.list,
+       chains = chains, iter = iter, warmup = warmup,
+       cores = cores, control = list(adapt_delta = apt_del),
+       thin = thin, seed = seed, pars = param_saved, refresh = 0)
+}
+
+bayes_model_QD <- function(x, y,
+                           param_saved = c("b0","b1","b2","OPT","sigma"),
+                           chains = 4, iter = 4000, warmup = 2000,
+                           cores = 1, apt_del = 0.95, thin = 5, seed = 123){
+  df.list <- list(x = x, y = y, N = length(y))
+  stan(model_code = stan_model_QD,
+       data = df.list,
+       chains = chains, iter = iter, warmup = warmup,
+       cores = cores, control = list(adapt_delta = apt_del),
+       thin = thin, seed = seed, pars = param_saved, refresh = 0)
+}
+
+```
+
+## Fit all candidate models
+
+```{r}
+bay.mod_LP  <- bayes_model_LinPl(x = dat$input_level, y = dat$response, cores = mc.cores)
+bay.mod_QP  <- bayes_model_QP   (x = dat$input_level, y = dat$response, cores = mc.cores)
+bay.mod_MIT <- bayes_model_MIT  (x = dat$input_level, y = dat$response, cores = mc.cores)
+bay.mod_QD  <- bayes_model_QD   (x = dat$input_level, y = dat$response, cores = mc.cores)
+
+```
+
+## Model diagnostics
+
+```{r}
+# Check convergence and sampling quality before interpreting BMA
+print(bay.mod_LP,  pars = c("tau", "OPT", "sigma"))
+print(bay.mod_QP,  pars = c("OPT", "sigma"))
+print(bay.mod_MIT, pars = c("OPT", "sigma"))
+print(bay.mod_QD,  pars = c("OPT", "sigma"))
+```
+
+## Posterior model probabilities via bridge sampling
+
+BMA weights come from posterior model probabilities, computed from marginal likelihoods. Bridge sampling is a standard approach for estimating these normalizing constants from MCMC output.
+
+```{r}
+# Bridge sampling is stochastic. Use the same model-specific seeds
+# as the original case study.
+set.seed(123)
+LP_marglog <- bridgesampling::bridge_sampler(bay.mod_LP, silent = TRUE)
+set.seed(124)
+QP_marglog <- bridgesampling::bridge_sampler(bay.mod_QP, silent = TRUE)
+set.seed(125)
+MIT_marglog <- bridgesampling::bridge_sampler(bay.mod_MIT, silent = TRUE)
+set.seed(126)
+QD_marglog <- bridgesampling::bridge_sampler(bay.mod_QD, silent = TRUE)
+
+m_prob <- bridgesampling::post_prob(
+  LP_marglog, QP_marglog, MIT_marglog, QD_marglog,
+  prior_prob = c(0.25, 0.25, 0.25, 0.25)
+)
+
+m_prob
+```
+
+## BMA posterior for the optimum
+
+We compute the BMA estimate as the posterior-mixture mean and the 95% credible interval from the weighted empirical posterior. A random sample from the mixture is generated only for plotting. This matches the original AONR case study.
+
+```{r}
+# Extract posterior OPT draws for the four candidate models
+posterior_draws_raw <- list(
+  LP  = rstan::extract(bay.mod_LP,  pars = "OPT")[["OPT"]],
+  QP  = rstan::extract(bay.mod_QP,  pars = "OPT")[["OPT"]],
+  MIT = rstan::extract(bay.mod_MIT, pars = "OPT")[["OPT"]],
+  QD  = rstan::extract(bay.mod_QD,  pars = "OPT")[["OPT"]]
+)
+
+# Restrict posterior optima to the observed nitrogen-rate range
+bounds <- range(dat$input_level)
+posterior_draws <- lapply(posterior_draws_raw, function(x) {
+  x <- pmin(pmax(x, bounds[1]), bounds[2])
+  x[!is.finite(x)] <- NA_real_
+  if (anyNA(x)) stop("Nonfinite OPT draws.")
+  x
+})
+
+draws_LP  <- posterior_draws$LP
+draws_QP  <- posterior_draws$QP
+draws_MIT <- posterior_draws$MIT
+draws_QD  <- posterior_draws$QD
+
+model_weights <- setNames(as.numeric(m_prob), names(posterior_draws))
+if (any(!is.finite(model_weights)) || any(model_weights < 0) ||
+    !isTRUE(all.equal(sum(model_weights), 1))) {
+  stop("Invalid posterior model probabilities.")
+}
+
+# Posterior mixture mean, as used in the original case study
+theta_bma_hat <- sum(model_weights * vapply(posterior_draws, mean, numeric(1)))
+
+# Equal-tailed 95% credible interval from the weighted empirical mixture
+pooled_draws <- unlist(posterior_draws, use.names = FALSE)
+draw_counts <- lengths(posterior_draws)
+draw_weights <- rep(model_weights / draw_counts, times = draw_counts)
+draw_order <- order(pooled_draws)
+cumulative_weight <- cumsum(draw_weights[draw_order])
+
+theta_bma_ci <- vapply(c(0.025, 0.975), function(p) {
+  pooled_draws[draw_order[which(cumulative_weight >= p)[1L]]]
+}, numeric(1))
+
+# Draw from the mixture for visualization only
+set.seed(123)
+mixture_index <- sample.int(
+  length(pooled_draws), size = sum(draw_counts),
+  replace = TRUE, prob = draw_weights
+)
+theta_bma <- pooled_draws[mixture_index]
+
+theta_bma_hat
+theta_bma_ci
+```
+
+# Visualization
+
+## BMA posterior distribution (95% CrI)
+
+```{r}
+ci <- theta_bma_ci
+theta_ci <- theta_bma[theta_bma >= ci[1] & theta_bma <= ci[2]]
+
+hist(
+  theta_ci,
+  breaks = 30,
+  main   = "BMA posterior distribution (95% CrI)",
+  xlab   = "BMA theta estimate"
+)
+
+```
+
+## Model-specific posterior distributions for OPT
+
+```{r, warning=FALSE}
+opt_draws_tbl <- bind_rows(
+  tibble(model = "LP",  theta = draws_LP),
+  tibble(model = "QP",  theta = draws_QP),
+  tibble(model = "MIT", theta = draws_MIT),
+  tibble(model = "QD",  theta = draws_QD)
+)
+
+ggplot(opt_draws_tbl, aes(x = theta)) +
+  geom_histogram(bins = 40, color = "black", fill = "gray80") +
+  facet_wrap(~ model, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 350), breaks = seq(0, 350, 50)) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(
+    x = "Estimate theta",
+    y = "Frequency"
+  )
+
+```
+
+## Final figure (data + representative model fits + BMA)
+
+```{r , fig.width=8, fig.height=4}
+new_grid <- tibble(input_level = 0:320)
+
+get_draws <- function(fit, pars) {
+  as_tibble(rstan::extract(fit, pars = pars, permuted = TRUE))
+}
+
+dLP  <- get_draws(bay.mod_LP,  c("b0","b1","tau"))
+dQP  <- get_draws(bay.mod_QP,  c("b0","b1","b2"))
+dMIT <- get_draws(bay.mod_MIT, c("b0","b1","b2"))
+dQD  <- get_draws(bay.mod_QD,  c("b0","b1","b2"))
+
+pLP  <- dLP  |> summarise(b0 = median(b0), b1 = median(b1), tau = median(tau))
+pQP  <- dQP  |> summarise(b0 = median(b0), b1 = median(b1), b2  = median(b2))
+pMIT <- dMIT |> summarise(b0 = median(b0), b1 = median(b1), b2  = median(b2))
+pQD  <- dQD  |> summarise(b0 = median(b0), b1 = median(b1), b2  = median(b2))
+
+lin_p <- function(x, b0, b1, tau) if_else(x < tau, b0 + b1*x, b0 + b1*tau)
+
+quad_p <- function(x, b0, b1, b2){
+  xp <- b1/(2*b2)
+  if_else(x < xp,
+          b0 + b1*x - b2*x^2,
+          b0 + b1*xp - b2*xp^2)
+}
+
+mits <- function(x, b0, b1, b2) b0 + (b1 - b0) * exp(-b2*x)
+
+pred_grid <- bind_rows(
+  new_grid |> mutate(model = "LP",
+                     y = lin_p(input_level, pLP$b0, pLP$b1, pLP$tau)),
+  new_grid |> mutate(model = "QP",
+                     y = quad_p(input_level, pQP$b0, pQP$b1, pQP$b2)),
+  new_grid |> mutate(model = "MIT",
+                     y = mits(input_level, pMIT$b0, pMIT$b1, pMIT$b2)),
+  new_grid |> mutate(model = "QD",
+                     y = (pQD$b0 + pQD$b1*input_level - pQD$b2*(input_level^2)))
+)
+
+opt_tbl <- tibble(
+  model = c("LP","QP","MIT","QD"),
+  x_opt = c(median(draws_LP), median(draws_QP), median(draws_MIT), median(draws_QD))
+) |>
+  mutate(
+    y_opt = case_when(
+      model == "LP"  ~ lin_p(x_opt,  pLP$b0,  pLP$b1,  pLP$tau),
+      model == "QP"  ~ quad_p(x_opt, pQP$b0,  pQP$b1,  pQP$b2),
+      model == "MIT" ~ mits(x_opt,   pMIT$b0, pMIT$b1, pMIT$b2),
+      model == "QD"  ~ (pQD$b0 + pQD$b1*x_opt - pQD$b2*(x_opt^2)),
+      TRUE ~ NA_real_
+    )
+  )
+
+
+Fig_BMA <- ggplot() +
+  geom_point(data = dat, aes(input_level, response),
+             alpha = 0.8, size = 1.5) +
+
+  geom_line(
+    data = pred_grid,
+    aes(x = input_level, y = y, linetype = model)
+  ) +
+
+  geom_point(
+    data = opt_tbl,
+    aes(x = x_opt, y = y_opt, shape = model),
+    size = 2.5, fill = "gray", stroke = 1.1
+  ) +
+
+  # BMA point + interval (black)
+  geom_point(aes(x = theta_bma_hat, y = 3000, color = "BMA"), size = 2) +
+  geom_errorbar(aes(y = 3000, xmin = theta_bma_ci[1], xmax = theta_bma_ci[2], color = "BMA"),
+                width = 0) +
+
+  scale_x_continuous(limits = c(0, 350), breaks = seq(0, 350, 50)) +
+  scale_y_continuous(limits = c(0, 14000), breaks = seq(0, 14000, 2000)) +
+
+  scale_shape_manual(values = c(LP = 21, QP = 22, MIT = 24, QD = 23)) +
+  scale_linetype_manual(values = c(LP = "solid",
+                                   QP = "dotted",
+                                   MIT = "longdash",
+                                   QD = "dotdash")) +
+  scale_color_manual(values = c("BMA" = "black")) +
+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(
+    x = expression(Nitrogen~rate~(kg~ha^-1)),
+    y = expression(Grain~yield~(kg~ha^-1)),
+    linetype = "Response model",
+    shape    = "Response model",
+    color    = "Averaging method"
+  )
+
+Fig_BMA
+
+```

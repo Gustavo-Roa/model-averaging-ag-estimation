@@ -1,0 +1,437 @@
+---
+title: "AIC-weighted bootstrap model averaging (AIC-WB)"
+subtitle: "Tutorial for estimating an optimum level or critical value under model uncertainty"
+author: "Gustavo A. Roa"
+date: "2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+## What this tutorial does
+
+This document shows how to estimate an *optimum level or critical value* under model uncertainty using:
+
+\- multiple candidate response models,
+
+\- nonparametric bootstrap to quantify uncertainty within each model, and
+
+\- Akaike Information Criterion (AIC) weights to average model-specific optimum estimates (AIC-WB).
+
+The dataset and the specific optimum definition used here are only examples. The workflow is the main deliverable.
+
+------------------------------------------------------------------------
+
+# Setup
+
+```{r}
+# Core packages
+library(tidyverse)
+library(minpack.lm)   # nlsLM
+
+# Data I/O
+library(readxl)
+
+```
+
+# Data
+
+## Load dataset
+
+```{r}
+dat <- read_excel("./case_study_AONR.xlsx", sheet = "Trial_27") |>
+  dplyr::select(
+    input_level = Total_N_SI,
+    response    = Yield_SY
+  ) |>
+  dplyr::filter(is.finite(input_level), is.finite(response))
+
+```
+
+
+## Visual check
+
+```{r}
+ggplot(dat, aes(input_level, response)) +
+  geom_point()
+
+```
+
+# Fit candidate models
+
+```{r}
+# Linear Plateau (LP)
+fm.LP <- nlsLM(response ~ ifelse(input_level < xs,
+                    a + b * input_level,
+                    a + b * xs),
+  data = dat,
+  start = list(
+    a  = unname(coef(lm(response ~ input_level, data = dat))[1]),
+    b  = unname(coef(lm(response ~ input_level, data = dat))[2]),
+    xs = unname(quantile(dat$input_level, 0.6, na.rm = TRUE))
+  ),
+  control = nls.lm.control(maxiter = 1024))
+
+# Quadratic Plateau (QP)
+fm.QP <- nlsLM(response ~ ifelse(input_level < (b1/(2*b2)),
+                    b0 + b1*input_level - b2*input_level^2,
+                    b0 + b1*(b1/(2*b2)) - b2*(b1/(2*b2))^2),
+  data = dat,
+  start = list(
+    b0 = unname(coef(lm(response ~ input_level, data = dat))[1]),
+    b1 = unname(coef(lm(response ~ input_level, data = dat))[2]),
+    b2 = unname(abs(coef(lm(response ~ input_level, data = dat))[2]) /
+                (2*unname(stats::quantile(dat$input_level, 0.6, na.rm=TRUE)) + 1e-8))
+  ),
+  lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+  control = nls.lm.control(maxiter = 1024))
+
+# Mitscherlich-Exponential (EXP)
+fm.MIT <- nlsLM(response ~ b0 + (b1 - b0) * exp(-b2 * input_level),
+  data = dat,
+  start = list(
+    b0 = unname(max(dat$response, na.rm = TRUE)),
+    b1 = unname(min(dat$response, na.rm = TRUE)),
+    b2 = 1 / unname(max(dat$input_level, na.rm = TRUE))
+  ),
+  lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+  control = nls.lm.control(maxiter = 1024))
+
+# Quadratic (QUA)
+fm.QUA <- lm(response ~ input_level + I(input_level^2), data=dat)
+
+```
+
+# Compute model-specific optimum estimates
+
+```{r}
+# Model-specific thresholds
+LP.est <- coef(fm.LP)[["xs"]]
+QP.est <- coef(fm.QP)[["b1"]] / (2 * coef(fm.QP)[["b2"]])
+
+b0 <- coef(fm.MIT)[["b0"]]
+b1 <- coef(fm.MIT)[["b1"]]
+b2 <- coef(fm.MIT)[["b2"]]
+MIT.est <- if (is.finite(b0) && b0 > 0 && b0 > b1 && b2 > 0) {
+  -log(0.05 * b0 / (b0 - b1)) / b2
+} else NA_real_
+
+# Center x for a numerically stable quadratic vertex
+bounds <- range(dat$input_level)
+xbar <- mean(dat$input_level)
+xc <- dat$input_level - xbar
+fit_qua <- lm(dat$response ~ xc + I(xc^2))
+b1 <- coef(fit_qua)[["xc"]]
+b2 <- coef(fit_qua)[["I(xc^2)"]]
+QUA.est <- if (all(is.finite(c(b1, b2))) && abs(b2) >= 1e-10) {
+  if (b2 > 0) {
+    pred <- predict(fit_qua, newdata = data.frame(xc = bounds - xbar))
+    bounds[which.max(pred)]
+  } else -b1 / (2 * b2) + xbar
+} else NA_real_
+
+# Restrict point estimates to the observed nitrogen-rate range
+theta <- c(LP = LP.est, QP = QP.est, MIT = MIT.est, QUA = QUA.est)
+theta[!is.finite(theta)] <- NA_real_
+theta <- pmin(pmax(theta, bounds[1]), bounds[2])
+LP.est <- unname(theta["LP"])
+QP.est <- unname(theta["QP"])
+MIT.est <- unname(theta["MIT"])
+QUA.est <- unname(theta["QUA"])
+
+LP.est; QP.est; MIT.est; QUA.est
+```
+
+# Bootstrap uncertainty for each model
+
+```{r}
+set.seed(123)
+R <- 5000L
+n <- nrow(dat)
+# Reuse the same 5,000 bootstrap samples across all four models
+bootstrap_rows <- replicate(R, sample.int(n, n, replace = TRUE))
+
+## Starts from full-data fits (more stable than re-deriving every time)
+LP_start <- as.list(coef(fm.LP))
+QP_start <- as.list(coef(fm.QP))
+MIT_start <- as.list(coef(fm.MIT))
+
+# LP  bootstrap: xs
+LP.bt <- sapply(seq_len(R), function(i) {
+  db <- dat[bootstrap_rows[, i], , drop = FALSE]
+
+  fitb <- try(
+    nlsLM(
+      response ~ ifelse(input_level < xs,
+                        a + b * input_level,
+                        a + b * xs),
+      data  = db,
+      start = LP_start,
+      control = nls.lm.control(maxiter = 1024)
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(fitb, "try-error") || !isTRUE(fitb$convInfo$isConv)) return(NA_real_)
+  as.numeric(coef(fitb)[["xs"]])
+})
+
+LP.bt <- pmin(pmax(LP.bt, bounds[1]), bounds[2])
+LP.ci <- quantile(LP.bt, c(0.025, 0.975), na.rm = TRUE)
+
+# QP bootstrap: xp = b1/(2*b2)
+QP.bt <- sapply(seq_len(R), function(i) {
+  db <- dat[bootstrap_rows[, i], , drop = FALSE]
+
+  fitb <- try(
+    nlsLM(
+      response ~ ifelse(input_level < (b1/(2*b2)),
+                        b0 + b1*input_level - b2*input_level^2,
+                        b0 + b1*(b1/(2*b2)) - b2*(b1/(2*b2))^2),
+      data  = db,
+      start = QP_start,
+      lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+      control = nls.lm.control(maxiter = 1024)
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(fitb, "try-error") || !isTRUE(fitb$convInfo$isConv)) return(NA_real_)
+
+  cf <- coef(fitb)
+  b1 <- as.numeric(cf[["b1"]])
+  b2 <- as.numeric(cf[["b2"]])
+
+  if (!is.finite(b1) || !is.finite(b2) || b2 <= 0) return(NA_real_)
+
+  xp <- b1 / (2 * b2)
+  if (!is.finite(xp)) return(NA_real_)
+
+  xp
+})
+
+QP.bt <- pmin(pmax(QP.bt, bounds[1]), bounds[2])
+QP.ci <- quantile(QP.bt, c(0.025, 0.975), na.rm = TRUE)
+
+# MIT bootstrap: x at targ% of plateau
+MIT.bt <- sapply(seq_len(R), function(i) {
+  db <- dat[bootstrap_rows[, i], , drop = FALSE]
+
+  fitb <- try(
+    nlsLM(
+      response ~ b0 + (b1 - b0) * exp(-b2 * input_level),
+      data  = db,
+      start = MIT_start,
+      lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+      control = nls.lm.control(maxiter = 1024)
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(fitb, "try-error") || !isTRUE(fitb$convInfo$isConv)) return(NA_real_)
+
+  cf <- coef(fitb)
+  b0 <- as.numeric(cf[["b0"]])
+  b1 <- as.numeric(cf[["b1"]])
+  b2 <- as.numeric(cf[["b2"]])
+
+  if (!all(is.finite(c(b0, b1, b2))) || b0 <= 0 || b2 <= 0 || b0 <= b1) return(NA_real_)
+
+  -log((1 - 0.95) * b0 / (b0 - b1)) / b2
+})
+
+MIT.bt <- pmin(pmax(MIT.bt, bounds[1]), bounds[2])
+MIT.ci <- quantile(MIT.bt, c(0.025, 0.975), na.rm = TRUE)
+
+# QUA bootstrap: centered quadratic vertex
+QUA.bt <- sapply(seq_len(R), function(i) {
+  db <- dat[bootstrap_rows[, i], , drop = FALSE]
+  xbar <- mean(db$input_level)
+  xc <- db$input_level - xbar
+  fitb <- try(lm(db$response ~ xc + I(xc^2)), silent = TRUE)
+  if (inherits(fitb, "try-error")) return(NA_real_)
+
+  b1 <- coef(fitb)[["xc"]]
+  b2 <- coef(fitb)[["I(xc^2)"]]
+  if (!all(is.finite(c(b1, b2))) || abs(b2) < 1e-10)
+    return(NA_real_)
+
+  if (b2 > 0) {
+    pred <- predict(fitb, newdata = data.frame(xc = bounds - xbar))
+    return(bounds[which.max(pred)])
+  }
+  -b1 / (2 * b2) + xbar
+})
+QUA.bt <- pmin(pmax(QUA.bt, bounds[1]), bounds[2])
+QUA.ci <- quantile(QUA.bt, c(0.025, 0.975), na.rm = TRUE)
+
+# Results
+tibble(
+  Model    = c("LP","QP","MIT","QUA"),
+  Estimate = c(LP.est, QP.est, MIT.est, QUA.est),
+  CI_2.5   = c(LP.ci[1], QP.ci[1], MIT.ci[1], QUA.ci[1]),
+  CI_97.5  = c(LP.ci[2], QP.ci[2], MIT.ci[2], QUA.ci[2])
+)
+
+```
+
+# AIC weights and AIC-WB optimum distribution
+
+## Compute AIC weights
+
+```{r}
+AICs <- c(
+  LP  = AIC(fm.LP),
+  QP  = AIC(fm.QP),
+  MIT = AIC(fm.MIT),
+  QUA = AIC(fm.QUA)
+)
+
+# Models with invalid point estimates receive zero weight
+AICs[!is.finite(theta)] <- Inf
+valid <- is.finite(AICs)
+if (!any(valid)) stop("No valid models for AIC-WB.")
+dAIC <- AICs[valid] - min(AICs[valid])
+w <- setNames(numeric(length(AICs)), names(AICs))
+w[valid] <- exp(-0.5 * dAIC) / sum(exp(-0.5 * dAIC))
+w
+```
+
+## AIC-WB point estimate and CI
+
+```{r}
+# Weights from the original data remain fixed across bootstrap replicates
+valid <- is.finite(theta) & w > 0
+theta_aic_hat <- weighted.mean(theta[valid], w[valid])
+
+bootstrap_theta <- cbind(LP = LP.bt, QP = QP.bt,
+                         MIT = MIT.bt, QUA = QUA.bt)
+
+# If a fit fails in a replicate, renormalize weights over valid models
+theta_aic_bt <- apply(bootstrap_theta, 1, function(x) {
+  valid <- is.finite(x) & w > 0
+  if (!any(valid)) return(NA_real_)
+  weighted.mean(x[valid], w[valid])
+})
+
+theta_aic_ci <- quantile(theta_aic_bt, c(0.025, 0.975), na.rm = TRUE)
+theta_aic_hat
+theta_aic_ci
+```
+
+# Visualization
+
+## AIC-WB bootstrap distribution
+
+```{r}
+ci <- theta_aic_ci
+theta_ci <- theta_aic_bt[theta_aic_bt >= ci[1] & theta_aic_bt <= ci[2]]
+
+hist(theta_ci,
+     breaks = 30,
+     main   = "AIC-weighted bootstrap distribution (95% CI)",
+     xlab   = "AIC-WB theta estimate")
+
+```
+
+## Model-specific bootstrap distributions
+
+```{r, warning=FALSE}
+df_aic_bt <- dplyr::bind_rows(
+  tibble(model = "LP",  theta = LP.bt),
+  tibble(model = "QP",  theta = QP.bt),
+  tibble(model = "MIT", theta = MIT.bt),
+  tibble(model = "QUA", theta = QUA.bt)
+) %>%
+  dplyr::filter(is.finite(theta))
+
+Fig_aic_hist <- ggplot(df_aic_bt, aes(x = theta)) +
+  geom_histogram(bins = 40, color = "black", fill = "gray80") +
+  facet_wrap(~ model, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 350), breaks = seq(0, 350, 50)) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(
+    x = "Estimate theta",
+    y = "Frequency"
+  )
+
+Fig_aic_hist
+
+```
+
+## Final figure (data + candidate fits + AIC-WB)
+
+```{r , fig.width=8, fig.height=4}
+new.input_levels <- data.frame(input_level = 0:320)
+
+prds.LP  <- predict(fm.LP,  new.input_levels)
+prds.QP  <- predict(fm.QP,  new.input_levels)
+prds.MIT <- predict(fm.MIT, new.input_levels)
+prds.QUA <- predict(fm.QUA, new.input_levels)
+
+opt_points <- tibble(
+  model = c("LP", "QP", "MIT", "QUA"),
+  x_opt = c(LP.est, QP.est, MIT.est, QUA.est),
+  y_opt = c(
+    predict(fm.LP,  newdata = data.frame(input_level = LP.est)),
+    predict(fm.QP,  newdata = data.frame(input_level = QP.est)),
+    predict(fm.MIT, newdata = data.frame(input_level = MIT.est)),
+    predict(fm.QUA, newdata = data.frame(input_level = QUA.est))
+  )
+)
+
+Fig_AIC <- ggplot() +
+  geom_point(data = dat, aes(input_level, response),
+             alpha = 0.8, size = 1.5) +
+
+  geom_line(aes(x = new.input_levels$input_level, y = prds.LP,  linetype = "LP")) +
+  geom_line(aes(x = new.input_levels$input_level, y = prds.QP,  linetype = "QP")) +
+  geom_line(aes(x = new.input_levels$input_level, y = prds.MIT, linetype = "MIT")) +
+  geom_line(aes(x = new.input_levels$input_level, y = prds.QUA, linetype = "QUA")) +
+
+  geom_point(data = opt_points,
+             aes(x = x_opt, y = y_opt, shape = model),
+             size = 2.5, fill = "gray", stroke = 1.1) +
+
+  geom_point(aes(x = theta_aic_hat, y = 3000, color = "AIC-WB"),
+             size = 2) +
+  geom_errorbar(aes(y = 3000,
+                    xmin = theta_aic_ci[1],
+                    xmax = theta_aic_ci[2],
+                    color = "AIC-WB"),
+                width = 0) +
+
+  scale_x_continuous(limits = c(0, 350), breaks = seq(0, 350, 50)) +
+  scale_y_continuous(limits = c(0, 14000), breaks = seq(0, 14000, 2000)) +
+
+  scale_shape_manual(values = c(LP = 21, QP = 22, MIT = 24, QUA = 23)) +
+  scale_linetype_manual(values = c(LP = "solid",
+                                   QP = "dotted",
+                                   MIT = "longdash",
+                                   QUA = "dotdash")) +
+
+  scale_color_manual(values = c("AIC-WB" = "black")) +
+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+
+  labs(
+    x = expression(Nitrogen~rate~(kg~ha^-1)),
+    y = expression(Grain~yield~(kg~ha^-1)),
+    linetype = "Response model",
+    shape    = "Response model",
+    color    = "Averaging method"
+  )
+
+Fig_AIC
+
+```

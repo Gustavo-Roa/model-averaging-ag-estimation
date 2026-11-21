@@ -1,0 +1,413 @@
+---
+title: "Bootstrap aggregation (Bagging)"
+subtitle: "Tutorial for estimating an optimum level or critical value under model uncertainty"
+author: "Gustavo A. Roa"
+date: "2026`"
+
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+## What this tutorial does
+
+This document shows how to estimate an *optimum level or critical value* under model uncertainty using:
+
+\- multiple candidate response models,
+
+\- bootstrap aggregation (bagging) by fitting a randomly selected candidate model to each bootstrap resample and pooling the resulting optimum estimates.
+
+The dataset and the specific optimum definition used here are only examples. The workflow is the main deliverable.
+
+------------------------------------------------------------------------
+
+# Setup
+
+```{r}
+# Core packages
+library(tidyverse)
+library(minpack.lm)   # nlsLM
+
+# Data I/O
+library(readxl)
+
+```
+
+# Data
+
+## Load dataset
+
+```{r}
+dat <- read_excel("./case_study_AONR.xlsx", sheet = "Trial_27") |>
+  dplyr::select(
+    input_level = Total_N_SI,
+    response    = Yield_SY
+  ) |>
+  dplyr::filter(is.finite(input_level), is.finite(response))
+
+if (!nrow(dat) || length(unique(dat$input_level)) < 3L) {
+  stop("Trial_27 requires at least three distinct finite nitrogen rates.")
+}
+```
+
+## Visual check
+
+```{r}
+ggplot(dat, aes(input_level, response)) +
+  geom_point() 
+
+```
+
+# Bagging (random model per resample)
+
+The bagging workflow is adapted from the bootstrap aggregation approach developed by Francisco Palmero for EONR estimation ([original implementation](https://github.com/FranciscoPalmero/Bagging_EONR_estimation)). This tutorial uses the AONR response models and fitting rules of the accompanying case study.
+
+## Define candidate response functions
+
+```{r}
+# Linear Plateau Model
+lin_p <- function(x, a, b, xs){
+  if_else(x < xs,
+          a + (b*x),
+          a + (b*xs))
+}
+
+# Quadratic Plateau Model
+quad_p <- function(x, b0, b1, b2){
+  xp  <- b1/(2*b2)
+  x_2 <- x^2
+  xp_2 <- xp^2
+
+  if_else(x < xp,
+          b0 + (b1*x) - (b2*x_2),
+          b0 + (b1*xp) - (b2*xp_2))
+}
+
+# Mitscherlich Model
+mits <- function(x, b0, b1, b2){
+  b0 + (b1 - b0) * exp(-b2*x)
+}
+
+```
+
+## Fit candidate models to the original data
+
+The bootstrap fits use the full-data coefficients as starting values, as in the original case study.
+
+```{r}
+linear_start <- coef(lm(response ~ input_level, data = dat))
+
+fm.LP <- nlsLM(response ~ ifelse(input_level < xs,
+  a + b * input_level, a + b * xs),
+  data = dat,
+  start = list(
+    a = unname(linear_start[1]),
+    b = unname(linear_start[2]),
+    xs = unname(quantile(dat$input_level, 0.6, na.rm = TRUE))
+  ),
+  control = nls.lm.control(maxiter = 1024)
+)
+
+fm.QP <- nlsLM(response ~ ifelse(input_level < b1 / (2 * b2),
+  b0 + b1 * input_level - b2 * input_level^2,
+  b0 + b1 * (b1 / (2 * b2)) - b2 * (b1 / (2 * b2))^2),
+  data = dat,
+  start = list(
+    b0 = unname(linear_start[1]),
+    b1 = unname(linear_start[2]),
+    b2 = unname(abs(linear_start[2]) /
+      (2 * quantile(dat$input_level, 0.6, na.rm = TRUE) + 1e-8))
+  ),
+  lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+  control = nls.lm.control(maxiter = 1024)
+)
+
+fm.MIT <- nlsLM(response ~ b0 + (b1 - b0) * exp(-b2 * input_level),
+  data = dat,
+  start = list(
+    b0 = unname(max(dat$response, na.rm = TRUE)),
+    b1 = unname(min(dat$response, na.rm = TRUE)),
+    b2 = 1 / unname(max(dat$input_level, na.rm = TRUE))
+  ),
+  lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+  control = nls.lm.control(maxiter = 1024)
+)
+
+LP_start <- as.list(coef(fm.LP))
+QP_start <- as.list(coef(fm.QP))
+MIT_start <- as.list(coef(fm.MIT))
+bounds <- range(dat$input_level)
+```
+
+## Bagging procedure
+
+Generate all bootstrap samples first, then select one of the four response models for each sample. This order preserves the random draws in the original case study.
+
+```{r}
+set.seed(123)
+K <- 5000L
+n <- nrow(dat)
+model_choices <- c("LP", "QP", "MIT", "QUA")
+
+bootstrap_rows <- replicate(K, sample.int(n, n, replace = TRUE))
+bag_model <- sample(model_choices, size = K, replace = TRUE)
+```
+
+## Fit random models to each bootstrap resample
+
+Only the selected model is fitted for each sample. Failed fits are recorded as missing estimates and excluded from the summary.
+
+```{r}
+bagg_models <- vector("list", K)
+
+for (i in seq_len(K)) {
+  db <- dat[bootstrap_rows[, i], , drop = FALSE]
+  mtofit <- bag_model[i]
+
+  fitM <- try(
+    switch(mtofit,
+      LP = nlsLM(response ~ ifelse(input_level < xs,
+        a + b * input_level, a + b * xs),
+        data = db, start = LP_start,
+        control = nls.lm.control(maxiter = 1024)),
+      QP = nlsLM(response ~ ifelse(input_level < b1 / (2 * b2),
+        b0 + b1 * input_level - b2 * input_level^2,
+        b0 + b1 * (b1 / (2 * b2)) - b2 * (b1 / (2 * b2))^2),
+        data = db, start = QP_start,
+        lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+        control = nls.lm.control(maxiter = 1024)),
+      MIT = nlsLM(response ~ b0 + (b1 - b0) * exp(-b2 * input_level),
+        data = db, start = MIT_start,
+        lower = c(b0 = -Inf, b1 = -Inf, b2 = 1e-10),
+        control = nls.lm.control(maxiter = 1024)),
+      QUA = lm(response ~ input_level + I(input_level^2), data = db)
+    ),
+    silent = TRUE
+  )
+
+  theta <- NA_real_
+  par1 <- par2 <- par3 <- NA_real_
+
+  if (!inherits(fitM, "try-error") &&
+      (inherits(fitM, "lm") || isTRUE(fitM$convInfo$isConv))) {
+    cf <- coef(fitM)
+
+    if (mtofit == "LP") {
+      theta <- unname(cf[["xs"]])
+    } else if (mtofit == "QP") {
+      if (all(is.finite(cf[c("b1", "b2")])) && cf[["b2"]] > 0)
+        theta <- unname(cf[["b1"]] / (2 * cf[["b2"]]))
+    } else if (mtofit == "MIT") {
+      b0 <- cf[["b0"]]; b1 <- cf[["b1"]]; b2 <- cf[["b2"]]
+      if (all(is.finite(c(b0, b1, b2))) &&
+          b0 > 0 && b2 > 0 && b0 > b1)
+        theta <- -log(0.05 * b0 / (b0 - b1)) / b2
+    } else {
+      # Centered quadratic optimum, matching the original case study
+      xbar <- mean(db$input_level)
+      xc <- db$input_level - xbar
+      fit_centered <- try(lm(db$response ~ xc + I(xc^2)), silent = TRUE)
+
+      if (!inherits(fit_centered, "try-error")) {
+        qc <- coef(fit_centered)
+        b1 <- unname(qc[["xc"]])
+        b2 <- unname(qc[["I(xc^2)"]])
+
+        if (all(is.finite(c(b1, b2))) && abs(b2) >= 1e-10) {
+          theta <- -b1 / (2 * b2) + xbar
+          if (b2 > 0) {
+            pred <- predict(fit_centered,
+              newdata = data.frame(xc = bounds - xbar))
+            theta <- bounds[which.max(pred)]
+          }
+        }
+      }
+    }
+
+    # Retain model coefficients for the tutorial's final figure
+    if (all(is.finite(cf))) {
+      par1 <- unname(cf[1])
+      par2 <- unname(cf[2])
+      par3 <- unname(cf[3])
+    }
+  }
+
+  # Apply observed-range restriction after deriving the optimum
+  if (is.finite(theta)) {
+    theta <- min(max(theta, bounds[1]), bounds[2])
+  } else {
+    theta <- NA_real_
+  }
+
+  bagg_models[[i]] <- tibble(
+    model = mtofit, par1 = par1, par2 = par2,
+    par3 = par3, theta = theta
+  )
+}
+
+df_bagg <- dplyr::bind_rows(bagg_models)
+```
+
+## Bagging results
+
+```{r}
+## Summaries by model (median + 95% CI)
+theta_by_model <- df_bagg %>%
+  dplyr::filter(is.finite(theta)) %>% 
+  dplyr::group_by(model) %>%
+  dplyr::summarise(
+    n       = dplyr::n(),
+    estimate = median(theta, na.rm = TRUE),
+    CI_2.5   = unname(quantile(theta, 0.025, na.rm = TRUE)),
+    CI_97.5  = unname(quantile(theta, 0.975, na.rm = TRUE)),
+    .groups  = "drop"
+  ) %>%
+  dplyr::arrange(factor(model, levels = c("LP","QP","MIT","QUA")))
+
+theta_by_model
+
+## Overall Bagging estimate (median + 95% CI)
+theta_bag     <- df_bagg$theta
+theta_bag_hat <- median(theta_bag, na.rm = TRUE)
+theta_bag_ci  <- quantile(theta_bag, c(0.025, 0.975), na.rm = TRUE)
+
+theta_bag_hat
+theta_bag_ci
+
+# Observed selection proportions (each model has probability 0.25)
+prop.table(table(factor(bag_model, levels = model_choices)))
+
+```
+
+# Visualization
+
+## Bagging bootstrap distribution
+
+```{r}
+ci <- quantile(theta_bag, probs = c(0.025, 0.975), na.rm = TRUE)
+
+theta_ci <- theta_bag[theta_bag >= ci[1] & theta_bag <= ci[2]]
+
+hist(theta_ci,
+     breaks = 30,
+     main   = "Bagging bootstrap distribution (95% CI)",
+     xlab   = "Bagging theta estimate")
+
+```
+
+## Model-specific bootstrap distributions
+
+```{r, warning=FALSE}
+theta_hist <- df_bagg %>%
+  dplyr::filter(is.finite(theta)) %>%
+  ggplot(aes(x = theta)) +
+  geom_histogram(bins = 40, color = "black", fill = "gray80") +
+  facet_wrap(~ model, scales = "free_y") +
+  scale_x_continuous(
+    limits = c(0, 350),
+    breaks = seq(0, 350, 50)
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Estimate theta",
+    y = "Frequency"
+  )
+
+theta_hist
+
+```
+
+## Final figure (data + candidate fits + Bagging)
+
+```{r , fig.width=8, fig.height=4}
+new.input_levels <- tibble(input_level = 0:320)
+
+pars_hat <- df_bagg %>%
+  dplyr::filter(is.finite(theta)) %>%
+  dplyr::group_by(model) %>%
+  dplyr::summarise(
+    par1_hat = median(par1, na.rm = TRUE),
+    par2_hat = median(par2, na.rm = TRUE),
+    par3_hat = median(par3, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pred_grid <- new.input_levels %>%
+  tidyr::crossing(model = c("LP","QP","MIT","QUA")) %>%
+  dplyr::left_join(pars_hat, by = "model") %>%
+  dplyr::mutate(
+    y = dplyr::case_when(
+      model == "LP"  ~ lin_p(input_level, a = par1_hat, b = par2_hat, xs = par3_hat),
+      model == "QP"  ~ quad_p(input_level, b0 = par1_hat, b1 = par2_hat, b2 = par3_hat),
+      model == "MIT" ~ mits(input_level, b0 = par1_hat, b1 = par2_hat, b2 = par3_hat),
+      model == "QUA" ~ (par1_hat + par2_hat*input_level + par3_hat*(input_level^2)),
+      TRUE ~ NA_real_
+    )
+  )
+
+opt_points_bag <- theta_by_model %>%
+  dplyr::select(model, x_opt = estimate, CI_2.5, CI_97.5) %>%
+  dplyr::left_join(pars_hat, by = "model") %>%
+  dplyr::mutate(
+    y_opt = dplyr::case_when(
+      model == "LP"  ~ lin_p(x_opt, a = par1_hat, b = par2_hat, xs = par3_hat),
+      model == "QP"  ~ quad_p(x_opt, b0 = par1_hat, b1 = par2_hat, b2 = par3_hat),
+      model == "MIT" ~ mits(x_opt, b0 = par1_hat, b1 = par2_hat, b2 = par3_hat),
+      model == "QUA" ~ (par1_hat + par2_hat*x_opt + par3_hat*(x_opt^2)),
+      TRUE ~ NA_real_
+    )
+  )
+
+Fig_bagging <- ggplot() +
+  geom_point(data = dat, aes(input_level, response),
+             alpha = 0.8, size = 1.5) +
+
+  geom_line(
+    data = pred_grid,
+    aes(x = input_level, y = y, linetype = model)
+  ) +
+
+  geom_point(
+    data = opt_points_bag,
+    aes(x = x_opt, y = y_opt, shape = model),
+    size = 2.5, fill = "gray", stroke = 1.1
+  ) +
+
+  geom_point(aes(x = theta_bag_hat, y = 3000, color = "Bagging"), size = 2) +
+  geom_errorbar(aes(y = 3000, xmin = theta_bag_ci[1], xmax = theta_bag_ci[2], color = "Bagging"),
+                width = 0) +
+
+  scale_x_continuous(limits = c(0, 350), breaks = seq(0, 350, 50)) +
+  scale_y_continuous(limits = c(0, 14000), breaks = seq(0, 14000, 2000)) +
+
+  scale_shape_manual(values = c(LP = 21, QP = 22, MIT = 24, QUA = 23)) +
+  scale_linetype_manual(values = c(LP = "solid",
+                                   QP = "dotted",
+                                   MIT = "longdash",
+                                   QUA = "dotdash")) +
+  scale_color_manual(values = c("Bagging" = "black")) +
+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(
+    x = expression(Nitrogen~rate~(kg~ha^-1)),
+    y = expression(Grain~yield~(kg~ha^-1)),
+    linetype = "Response model",
+    shape    = "Response model",
+    color    = "Averaging method"
+  )
+
+Fig_bagging
+
+```
